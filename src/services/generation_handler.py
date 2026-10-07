@@ -1252,6 +1252,26 @@ def _apply_current_flow_model_catalog():
                 },
                 f"Omni 1.1 Flash · {seconds}s · {orientation}",
             )
+            # 1080p variant: generate, then the free upscale behind Flow's "Download 1080p".
+            register(
+                f"omni-1.1-flash-{seconds}s-{orientation}-1080p",
+                {
+                    "type": "video",
+                    "video_type": "omni",
+                    "model_key": f"abra_t2v_{seconds}s",
+                    "reference_model_key": f"abra_r2v_{seconds}s",
+                    "reference_duration": seconds,
+                    "aspect_ratio": ratio,
+                    "supports_images": True,
+                    "min_images": 0,
+                    "max_images": 3,
+                    "use_v2_model_config": True,
+                    "allow_tier_upgrade": False,
+                    # Flow's UI upscales Omni with the Veo upsampler too (captured 2026-10-07).
+                    "upsample": {"resolution": "VIDEO_RESOLUTION_1080P", "model_key": "veo_3_1_upsampler_1080p"},
+                },
+                f"Omni 1.1 Flash · {seconds}s · {orientation} · 1080p",
+            )
 
     # Current image-to-video and reference-video variants.
     for seconds, lite_key, fast_key, quality_key in (
