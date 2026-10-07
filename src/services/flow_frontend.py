@@ -397,16 +397,29 @@ class FlowFrontendMixin:
             ]
         elif normalized_mode == "upsample":
             rpc_id = "p0UkFb"
-            request = [
-                [None, str(video_media_id or "").strip()],
-                None,
-                aspect_value,
-                random.randint(1, 2147483647),
-                metadata,
-                None,
-                resolution_value,
-                output_spec,
-            ]
+            if "1080" in str(resolution or ""):
+                # Mirrors the request Flow's UI sends for "Download 1080p" (captured 2026-10-07): no seed,
+                # 5-field metadata, resolution enum 2, no output spec. Flow rejects the generic shape below.
+                request = [
+                    [None, str(video_media_id or "").strip()],
+                    None,
+                    aspect_value,
+                    None,
+                    [None, session_id, None, None, str(uuid.uuid4()).upper()],
+                    None,
+                    2,
+                ]
+            else:
+                request = [
+                    [None, str(video_media_id or "").strip()],
+                    None,
+                    aspect_value,
+                    random.randint(1, 2147483647),
+                    metadata,
+                    None,
+                    resolution_value,
+                    output_spec,
+                ]
             if model_key:
                 request.extend([None] * (31 - len(request)))
                 request.append(model_key)
@@ -438,10 +451,13 @@ class FlowFrontendMixin:
 
         def walk(value: Any) -> None:
             if isinstance(value, list):
+                # Upscaled media is "<uuid>_upsampled" and Flow files it under the account's own project.
+                upsampled = isinstance(value[0] if value else None, str) and str(value[0]).endswith("_upsampled") \
+                    and cls._is_uuid(str(value[0])[: -len("_upsampled")])
                 if (
                     len(value) >= 3
-                    and cls._is_uuid(value[0])
-                    and (project_id is None or str(value[1] or "") == project_id)
+                    and (cls._is_uuid(value[0]) or upsampled)
+                    and (project_id is None or upsampled or str(value[1] or "") == project_id)
                     and cls._is_uuid(value[2])
                 ):
                     records.append(value)
