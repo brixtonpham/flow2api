@@ -4604,6 +4604,9 @@ class _FlowClientBase(FlowFrontendMixin):
         if "model_access_denied" in error_lower:
             # 账号无对应模型权限，重试不会改变结果
             return None
+        if any(k in error_lower for k in ("unsafe", "safety", "filter", "sexual")):
+            # Content refusals repeat on retry; each retry only spends a captcha token.
+            return None
         if "403" in error_lower:
             return "403错误"
         if "429" in error_lower or "too many requests" in error_lower:
@@ -5512,8 +5515,6 @@ class _FlowClientBase(FlowFrontendMixin):
                         "pageAction": page_action,
                     },
                 }
-                if method == "yescaptcha":
-                    create_data["softID"] = "33424"
                 if effective_user_agent:
                     create_data["task"]["userAgent"] = effective_user_agent
                 if min_score is not None:

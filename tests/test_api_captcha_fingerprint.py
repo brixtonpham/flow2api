@@ -122,7 +122,7 @@ class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
             "Windows", user_agent, "userAgent 应当来自打码服务 solution, 包含 Windows"
         )
         self.assertIn("Chrome/147", user_agent)
-        self.assertEqual(fake_session.requests[0][1]["json"]["softID"], "33424")
+        self.assertNotIn("softID", fake_session.requests[0][1]["json"])
 
     async def test_captcharun_uses_v2_task_api(self):
         flow = FlowClient.__new__(FlowClient)

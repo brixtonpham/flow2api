@@ -542,8 +542,6 @@ async def _solve_recaptcha_with_api_service(
         pass
 
     create_payload = {"clientKey": client_key, "task": task}
-    if method == "yescaptcha":
-        create_payload["softID"] = "33424"
 
     async with AsyncSession() as session:
         create_resp = await session.post(
