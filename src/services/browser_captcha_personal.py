@@ -11405,6 +11405,7 @@ class BrowserCaptchaService:
         tab,
         action: str = "IMAGE_GENERATION",
         project_id: Optional[str] = None,
+        prepare_project: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Execute the page's pre-hijack reCAPTCHA closure on the current Flow app.
 
@@ -11415,10 +11416,13 @@ class BrowserCaptchaService:
         """
         normalized_action = str(action or "IMAGE_GENERATION").strip().upper()
         normalized_project_id = str(project_id or "").strip()
-        if normalized_action != "CHAT_GENERATION" or not normalized_project_id:
+        prepare = bool(normalized_project_id) and (
+            prepare_project or normalized_action == "CHAT_GENERATION"
+        )
+        if not prepare:
             await self._wait_for_recaptcha(tab)
 
-        if normalized_action == "CHAT_GENERATION" and normalized_project_id:
+        if prepare:
             await self._apply_trusted_recaptcha_hook(
                 tab, label=f"direct_project:{normalized_project_id}"
             )
@@ -12286,6 +12290,107 @@ class BrowserCaptchaService:
                 await self._release_resident_slot_reservation(
                     reserved_slot_id,
                     resident_info=self._resident_tabs.get(reserved_slot_id),
+                )
+
+    async def submit_batchexecute_in_page(
+        self,
+        *,
+        project_id: str,
+        rpc_id: str,
+        action: str,
+        build_argument,
+        token_id: Optional[int],
+        timeout: int,
+    ) -> Dict[str, str]:
+        """Mint the token and send a batchexecute RPC from the same Flow tab.
+
+        Token, cookies, Flow session and TLS fingerprint all belong to this browser,
+        which is what Flow's UI does; a token sent from elsewhere gets UNUSUAL_ACTIVITY.
+        ``build_argument(token, session_id)`` returns the RPC argument list.
+        """
+        self._mark_runtime_active()
+        await self.initialize()
+        slot_id, resident_info = await self._ensure_resident_tab(
+            project_id, token_id=token_id, reserve_for_solve=True, return_slot_key=True
+        )
+        reservation_consumed = False
+        try:
+            if not slot_id or not resident_info:
+                raise RuntimeError("personal browser has no Flow tab for this project")
+            async with resident_info.solve_lock:
+                await self._consume_resident_slot_reservation(
+                    slot_id, resident_info=resident_info
+                )
+                reservation_consumed = True
+                solved = await self._execute_recaptcha_on_tab(
+                    resident_info.tab, action, project_id=project_id, prepare_project=True
+                )
+                token = str((solved or {}).get("token") or "")
+                if not token:
+                    raise RuntimeError(f"personal reCAPTCHA failed: action={action}")
+                session_id = self._generate_native_flow_session_id()
+                f_req = json.dumps(
+                    [[[rpc_id, json.dumps(build_argument(token, session_id),
+                                          separators=(",", ":")), None, "generic"]]],
+                    separators=(",", ":"),
+                )
+                values = {
+                    "rpcId": rpc_id,
+                    "sourcePath": f"/project/{project_id}",
+                    "fReq": f_req,
+                    "timeoutMs": max(5000, int(timeout * 1000)),
+                }
+                script = """(async config => {
+                    const boot = await (await fetch(location.href, {credentials: 'include'})).text();
+                    const bl = boot.match(/boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+/);
+                    const sid = boot.match(/"FdrFJe":"(-?[0-9]+)"/);
+                    const at = boot.match(/"SNlM0e":"([^"]+)"/);
+                    if (!bl || !sid || !at) throw new Error('Flow bootstrap metadata is unavailable');
+                    const body = new URLSearchParams();
+                    body.set('f.req', config.fReq);
+                    body.set('at', at[1]);
+                    const url = '/_/AiSandboxAngularFrontend/data/batchexecute' +
+                        `?rpcids=${encodeURIComponent(config.rpcId)}` +
+                        `&source-path=${encodeURIComponent(config.sourcePath)}` +
+                        `&bl=${encodeURIComponent(bl[0])}&f.sid=${sid[1]}` +
+                        `&hl=${encodeURIComponent(navigator.language || 'en')}` +
+                        `&_reqid=${Math.floor(100000 + Math.random() * 900000)}&rt=c`;
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort('flow_rpc_timeout'), config.timeoutMs);
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST', credentials: 'include', body, signal: controller.signal,
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                                      'x-same-domain': '1'}
+                        });
+                        return {status: response.status, text: await response.text()};
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                })(__REQUEST_CONFIG__)""".replace(
+                    "__REQUEST_CONFIG__",
+                    json.dumps(values, ensure_ascii=False, separators=(",", ":")),
+                )
+                result = await self._tab_evaluate(
+                    resident_info.tab,
+                    script,
+                    label=f"page_rpc:{rpc_id}:{project_id}",
+                    timeout_seconds=max(35.0, float(timeout) + 10.0),
+                    await_promise=True,
+                    return_by_value=True,
+                )
+            if not isinstance(result, dict):
+                raise RuntimeError(f"personal page RPC returned no payload: rpc={rpc_id}")
+            status = int(result.get("status") or 0)
+            text = str(result.get("text") or "")
+            if status < 200 or status >= 300:
+                raise RuntimeError(f"personal page RPC {rpc_id} HTTP {status}: {text[:300]}")
+            resident_info.last_used_at = time.time()
+            return {"text": text, "session_id": session_id}
+        finally:
+            if slot_id and not reservation_consumed:
+                await self._release_resident_slot_reservation(
+                    slot_id, resident_info=self._resident_tabs.get(slot_id)
                 )
 
     async def _execute_native_harvest_on_tab(
@@ -16351,6 +16456,19 @@ class _PersonalBrowserPoolService:
                     result.get("session_id"), worker_index
                 )
             return result
+        finally:
+            await self._release_worker_reservation(worker_index)
+
+    async def submit_batchexecute_in_page(self, **kwargs) -> Dict[str, str]:
+        await self._ensure_workers()
+        worker_index = None
+        try:
+            worker_index, worker = await self._acquire_worker(
+                project_id=kwargs.get("project_id"),
+                token_id=kwargs.get("token_id"),
+                ensure_workers=False,
+            )
+            return await worker.submit_batchexecute_in_page(**kwargs)
         finally:
             await self._release_worker_reservation(worker_index)
 

@@ -290,6 +290,34 @@ class CurrentFlowClientMixin:
         mime_type = self._detect_image_mime_type(image_bytes)
         extension = "png" if "png" in mime_type else "jpg"
         filename = f"flow2api_{uuid.uuid4().hex[:12]}.{extension}"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+
+        def upload_argument(recaptcha_token: str, _session_id: str = "") -> List[Any]:
+            return [
+                self._frontend_project_context(normalized_project_id, recaptcha_token),
+                encoded,
+                mime_type,
+                1,
+                None,
+                None,
+                None,
+                None,
+                filename,
+                None,
+                str(uuid.uuid4()).upper(),
+                str(uuid.uuid4()).upper(),
+            ]
+
+        if config.captcha_method == "personal":
+            payload, _ = await self._personal_page_rpc(
+                project_id=normalized_project_id,
+                rpc_id="maseQ",
+                action="UPLOAD_IMAGE",
+                build_argument=upload_argument,
+                token_id=token_id,
+                timeout=max(self._get_control_plane_timeout(), 90),
+            )
+            return self._frontend_upload_media_id(payload, normalized_project_id)
         recaptcha_token, browser_id = await self._get_recaptcha_token(
             normalized_project_id,
             action="UPLOAD_IMAGE",
@@ -302,45 +330,28 @@ class CurrentFlowClientMixin:
         if not recaptcha_token:
             raise RuntimeError("Failed to obtain reCAPTCHA token for image upload")
         try:
-            context = self._frontend_project_context(
-                normalized_project_id,
-                recaptcha_token,
-            )
             payload = await self._current_rpc(
                 rpc_id="maseQ",
-                argument=[
-                    context,
-                    base64.b64encode(image_bytes).decode("ascii"),
-                    mime_type,
-                    1,
-                    None,
-                    None,
-                    None,
-                    None,
-                    filename,
-                    None,
-                    str(uuid.uuid4()).upper(),
-                    str(uuid.uuid4()).upper(),
-                ],
+                argument=upload_argument(recaptcha_token),
                 google_cookies=google_cookies,
                 token_id=token_id,
                 project_id=normalized_project_id,
                 timeout=max(self._get_control_plane_timeout(), 90),
             )
-            media_url = self._find_flow_content_url(payload, "image")
-            media_id = ""
-            if media_url:
-                match = re.search(r"/image/([0-9a-f-]{36})", media_url, re.I)
-                media_id = match.group(1) if match else ""
-            media_id = media_id or self._find_uuid_value(
-                payload,
-                excluded={normalized_project_id},
-            )
-            if not media_id:
-                raise RuntimeError("Flow frontend upload response missing mediaId")
-            return media_id
+            return self._frontend_upload_media_id(payload, normalized_project_id)
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
+
+    def _frontend_upload_media_id(self, payload: Any, project_id: str) -> str:
+        media_url = self._find_flow_content_url(payload, "image")
+        media_id = ""
+        if media_url:
+            match = re.search(r"/image/([0-9a-f-]{36})", media_url, re.I)
+            media_id = match.group(1) if match else ""
+        media_id = media_id or self._find_uuid_value(payload, excluded={project_id})
+        if not media_id:
+            raise RuntimeError("Flow frontend upload response missing mediaId")
+        return media_id
 
     async def generate_image(
         self,
@@ -448,6 +459,35 @@ class CurrentFlowClientMixin:
                     trace["generation_attempts"].append(attempt)
                     trace["final_success_attempt"] = retry_attempt + 1
                     return result, session_id, trace
+
+                if personal_mode:
+                    if progress_callback:
+                        await progress_callback("submitting_image", 48)
+                    attempt["recaptcha_ok"] = True
+                    payload, page_session_id = await self._personal_page_rpc(
+                        project_id=project_id,
+                        rpc_id="ogiZ0b",
+                        action="IMAGE_GENERATION",
+                        build_argument=lambda tok, sid: self._build_frontend_image_generation_argument(
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_name=model_name,
+                            aspect_ratio=aspect_ratio,
+                            recaptcha_token=tok,
+                            session_id=sid,
+                            image_inputs=image_inputs,
+                        ),
+                        token_id=token_id,
+                        timeout=max(
+                            self._get_runtime_config().flow_image_request_timeout, 90
+                        ),
+                    )
+                    result = self._normalize_frontend_image_generation_response(payload)
+                    attempt["success"] = True
+                    attempt["duration_ms"] = int((time.time() - started_at) * 1000)
+                    trace["generation_attempts"].append(attempt)
+                    trace["final_success_attempt"] = retry_attempt + 1
+                    return result, page_session_id, trace
 
                 # 通道与 action 必须按打码方式配套：
                 # - personal 默认纯文生横图已在上面的原子浏览器流程处理；
@@ -584,23 +624,42 @@ class CurrentFlowClientMixin:
         raise last_error or RuntimeError("Flow frontend image generation failed")
 
     def _resolve_batchexecute_captcha_override(self) -> Optional[str]:
-        """batchexecute 类 RPC（SPrCad 放大、YhhmEf 视频等）只接受第三方打码 token。
+        """Use the configured captcha method; never force a paid solver.
 
-        browser/personal harvest 的 token 会被 UNUSUAL_ACTIVITY 拒绝（实测矩阵）。
-        browser 类模式下必须配置第三方打码密钥，否则直接返回明确配置错误。
+        personal mode sends batchexecute RPCs from its own Flow tab
+        (``_personal_page_rpc``), so its token, cookies and session match.
         """
-        if config.captcha_method not in ("browser", "personal", "remote_browser", "extension"):
-            return None
-        method = self._resolve_third_party_captcha_method()
-        if not method:
-            raise RuntimeError(
-                "当前浏览器打码模式不支持该 Flow RPC；请先配置 YesCaptcha、"
-                "Captcha.run、CapMonster、EzCaptcha 或 CapSolver API Key"
-            )
-        debug_logger.log_info(
-            f"[batchexecute] 使用第三方打码方式: {method} (configured={config.captcha_method})"
+        return None
+
+    async def _personal_page_rpc(
+        self,
+        *,
+        project_id: str,
+        rpc_id: str,
+        action: str,
+        build_argument: Callable[[str, str], List[Any]],
+        token_id: Optional[int],
+        timeout: int,
+    ) -> tuple[Any, str]:
+        from .browser_captcha_personal import BrowserCaptchaService
+
+        service = getattr(self, "_personal_browser_service", None)
+        if service is None:
+            service = await BrowserCaptchaService.get_instance(getattr(self, "db", None))
+        result = await service.submit_batchexecute_in_page(
+            project_id=project_id,
+            rpc_id=rpc_id,
+            action=action,
+            build_argument=build_argument,
+            token_id=token_id,
+            timeout=timeout,
         )
-        return method
+        frames = self._parse_batchexecute_frames(result["text"])
+        self._raise_batchexecute_error(frames, rpc_id)
+        payload = self._extract_batchexecute_payload(frames, rpc_id)
+        if payload is None:
+            raise RuntimeError(f"Flow page RPC returned no payload: rpc={rpc_id}")
+        return payload, result["session_id"]
 
     async def upsample_image(
         self,
@@ -670,6 +729,44 @@ class CurrentFlowClientMixin:
         for retry_attempt in range(max_retries):
             browser_id = None
             try:
+                if config.captcha_method == "personal":
+                    rpc_ids: List[str] = []
+
+                    def video_argument(tok: str, sid: str) -> List[Any]:
+                        rpc, arg = self._build_frontend_video_generation_argument(
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_key=model_key,
+                            aspect_ratio=aspect_ratio,
+                            recaptcha_token=tok,
+                            session_id=sid,
+                            mode=mode,
+                            reference_media_ids=reference_media_ids,
+                            start_media_id=start_media_id,
+                            end_media_id=end_media_id,
+                            video_media_id=video_media_id,
+                            resolution=resolution,
+                        )
+                        rpc_ids.append(rpc)
+                        return arg
+
+                    # Build once to learn the rpc id; the page call rebuilds with its token.
+                    video_argument("", "")
+                    payload, _ = await self._personal_page_rpc(
+                        project_id=project_id,
+                        rpc_id=rpc_ids[0],
+                        action="VIDEO_GENERATION",
+                        build_argument=video_argument,
+                        token_id=token_id,
+                        timeout=max(self._get_video_submit_timeout(), 90),
+                    )
+                    return self._normalize_frontend_video_submission(
+                        payload,
+                        project_id=project_id,
+                        aspect_ratio=aspect_ratio,
+                        model_key=model_key,
+                        rpc_id=rpc_ids[0],
+                    )
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
                     action="VIDEO_GENERATION",
@@ -712,8 +809,12 @@ class CurrentFlowClientMixin:
                 )
             except Exception as error:
                 last_error = error
-                # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
-                if "MODEL_ACCESS_DENIED" in str(error):
+                # Account and content refusals don't change on retry; retrying only
+                # spends another captcha token.
+                if any(
+                    marker in str(error)
+                    for marker in ("MODEL_ACCESS_DENIED", "PUBLIC_ERROR", "UNSAFE", "SAFETY", "FILTER")
+                ):
                     raise
                 if retry_attempt >= max_retries - 1:
                     raise
